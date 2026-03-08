@@ -1,10 +1,20 @@
 import {
+  buildAccountScopedDmSecurityPolicy,
+  buildOpenGroupPolicyConfigureRouteAllowlistWarning,
+  collectAllowlistProviderGroupPolicyWarnings,
+  createScopedAccountConfigAccessors,
+  formatNormalizedAllowFromEntries,
+} from "openclaw/plugin-sdk/compat";
+import {
   applyAccountNameToChannelSection,
+  applySetupAccountConfigPatch,
+  buildComputedAccountStatusSnapshot,
   buildChannelConfigSchema,
   DEFAULT_ACCOUNT_ID,
   deleteAccountFromConfigSection,
-  formatPairingApproveHint,
   getChatChannelMeta,
+  listDirectoryGroupEntriesFromMapKeys,
+  listDirectoryUserEntriesFromAllowFrom,
   migrateBaseNameToDefaultAccount,
   missingTargetError,
   normalizeAccountId,
@@ -15,10 +25,10 @@ import {
   type ChannelDock,
   type ChannelMessageActionAdapter,
   type ChannelPlugin,
-  type MoltbotConfig,
-} from "clawdbot/plugin-sdk";
-import { GoogleChatConfigSchema } from "clawdbot/plugin-sdk";
-
+  type ChannelStatusIssue,
+  type OpenClawConfig,
+} from "openclaw/plugin-sdk/googlechat";
+import { GoogleChatConfigSchema } from "openclaw/plugin-sdk/googlechat";
 import {
   listGoogleChatAccountIds,
   resolveDefaultGoogleChatAccountId,
@@ -27,9 +37,9 @@ import {
 } from "./accounts.js";
 import { googlechatMessageActions } from "./actions.js";
 import { sendGoogleChatMessage, uploadGoogleChatAttachment, probeGoogleChat } from "./api.js";
+import { resolveGoogleChatWebhookPath, startGoogleChatMonitor } from "./monitor.js";
 import { googlechatOnboardingAdapter } from "./onboarding.js";
 import { getGoogleChatRuntime } from "./runtime.js";
-import { resolveGoogleChatWebhookPath, startGoogleChatMonitor } from "./monitor.js";
 import {
   isGoogleChatSpaceTarget,
   isGoogleChatUserTarget,
@@ -47,6 +57,17 @@ const formatAllowFromEntry = (entry: string) =>
     .replace(/^users\//i, "")
     .toLowerCase();
 
+const googleChatConfigAccessors = createScopedAccountConfigAccessors({
+  resolveAccount: ({ cfg, accountId }) => resolveGoogleChatAccount({ cfg, accountId }),
+  resolveAllowFrom: (account: ResolvedGoogleChatAccount) => account.config.dm?.allowFrom,
+  formatAllowFrom: (allowFrom) =>
+    formatNormalizedAllowFromEntries({
+      allowFrom,
+      normalizeEntry: formatAllowFromEntry,
+    }),
+  resolveDefaultTo: (account: ResolvedGoogleChatAccount) => account.config.defaultTo,
+});
+
 export const googlechatDock: ChannelDock = {
   id: "googlechat",
   capabilities: {
@@ -57,17 +78,7 @@ export const googlechatDock: ChannelDock = {
     blockStreaming: true,
   },
   outbound: { textChunkLimit: 4000 },
-  config: {
-    resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveGoogleChatAccount({ cfg: cfg as MoltbotConfig, accountId }).config.dm?.allowFrom ??
-        []
-      ).map((entry) => String(entry)),
-    formatAllowFrom: ({ allowFrom }) =>
-      allowFrom
-        .map((entry) => String(entry))
-        .filter(Boolean)
-        .map(formatAllowFromEntry),
-  },
+  config: googleChatConfigAccessors,
   groups: {
     resolveRequireMention: resolveGoogleChatGroupRequireMention,
   },
@@ -103,8 +114,10 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
     idLabel: "googlechatUserId",
     normalizeAllowEntry: (entry) => formatAllowFromEntry(entry),
     notifyApproval: async ({ cfg, id }) => {
-      const account = resolveGoogleChatAccount({ cfg: cfg as MoltbotConfig });
-      if (account.credentialSource === "none") return;
+      const account = resolveGoogleChatAccount({ cfg: cfg });
+      if (account.credentialSource === "none") {
+        return;
+      }
       const user = normalizeGoogleChatTarget(id) ?? id;
       const target = isGoogleChatUserTarget(user) ? user : `users/${user}`;
       const space = await resolveGoogleChatOutboundSpace({ account, target });
@@ -129,13 +142,12 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
   reload: { configPrefixes: ["channels.googlechat"] },
   configSchema: buildChannelConfigSchema(GoogleChatConfigSchema),
   config: {
-    listAccountIds: (cfg) => listGoogleChatAccountIds(cfg as MoltbotConfig),
-    resolveAccount: (cfg, accountId) =>
-      resolveGoogleChatAccount({ cfg: cfg as MoltbotConfig, accountId }),
-    defaultAccountId: (cfg) => resolveDefaultGoogleChatAccountId(cfg as MoltbotConfig),
+    listAccountIds: (cfg) => listGoogleChatAccountIds(cfg),
+    resolveAccount: (cfg, accountId) => resolveGoogleChatAccount({ cfg: cfg, accountId }),
+    defaultAccountId: (cfg) => resolveDefaultGoogleChatAccountId(cfg),
     setAccountEnabled: ({ cfg, accountId, enabled }) =>
       setAccountEnabledInConfigSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         sectionKey: "googlechat",
         accountId,
         enabled,
@@ -143,7 +155,7 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
       }),
     deleteAccount: ({ cfg, accountId }) =>
       deleteAccountFromConfigSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         sectionKey: "googlechat",
         accountId,
         clearBaseFields: [
@@ -165,44 +177,38 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
       configured: account.credentialSource !== "none",
       credentialSource: account.credentialSource,
     }),
-    resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveGoogleChatAccount({
-        cfg: cfg as MoltbotConfig,
-        accountId,
-      }).config.dm?.allowFrom ?? []
-      ).map((entry) => String(entry)),
-    formatAllowFrom: ({ allowFrom }) =>
-      allowFrom
-        .map((entry) => String(entry))
-        .filter(Boolean)
-        .map(formatAllowFromEntry),
+    ...googleChatConfigAccessors,
   },
   security: {
     resolveDmPolicy: ({ cfg, accountId, account }) => {
-      const resolvedAccountId = accountId ?? account.accountId ?? DEFAULT_ACCOUNT_ID;
-      const useAccountPath = Boolean(
-        (cfg as MoltbotConfig).channels?.["googlechat"]?.accounts?.[resolvedAccountId],
-      );
-      const allowFromPath = useAccountPath
-        ? `channels.googlechat.accounts.${resolvedAccountId}.dm.`
-        : "channels.googlechat.dm.";
-      return {
-        policy: account.config.dm?.policy ?? "pairing",
+      return buildAccountScopedDmSecurityPolicy({
+        cfg,
+        channelKey: "googlechat",
+        accountId,
+        fallbackAccountId: account.accountId ?? DEFAULT_ACCOUNT_ID,
+        policy: account.config.dm?.policy,
         allowFrom: account.config.dm?.allowFrom ?? [],
-        allowFromPath,
-        approveHint: formatPairingApproveHint("googlechat"),
+        allowFromPathSuffix: "dm.",
         normalizeEntry: (raw) => formatAllowFromEntry(raw),
-      };
+      });
     },
     collectWarnings: ({ account, cfg }) => {
-      const warnings: string[] = [];
-      const defaultGroupPolicy = cfg.channels?.defaults?.groupPolicy;
-      const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
-      if (groupPolicy === "open") {
-        warnings.push(
-          `- Google Chat spaces: groupPolicy="open" allows any space to trigger (mention-gated). Set channels.googlechat.groupPolicy="allowlist" and configure channels.googlechat.groups.`,
-        );
-      }
+      const warnings = collectAllowlistProviderGroupPolicyWarnings({
+        cfg,
+        providerConfigPresent: cfg.channels?.googlechat !== undefined,
+        configuredGroupPolicy: account.config.groupPolicy,
+        collect: (groupPolicy) =>
+          groupPolicy === "open"
+            ? [
+                buildOpenGroupPolicyConfigureRouteAllowlistWarning({
+                  surface: "Google Chat spaces",
+                  openScope: "any space",
+                  groupPolicyPath: "channels.googlechat.groupPolicy",
+                  routeAllowlistPath: "channels.googlechat.groups",
+                }),
+              ]
+            : [],
+      });
       if (account.config.dm?.policy === "open") {
         warnings.push(
           `- Google Chat DMs are open to anyone. Set channels.googlechat.dm.policy="pairing" or "allowlist".`,
@@ -231,37 +237,26 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
     self: async () => null,
     listPeers: async ({ cfg, accountId, query, limit }) => {
       const account = resolveGoogleChatAccount({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         accountId,
       });
-      const q = query?.trim().toLowerCase() || "";
-      const allowFrom = account.config.dm?.allowFrom ?? [];
-      const peers = Array.from(
-        new Set(
-          allowFrom
-            .map((entry) => String(entry).trim())
-            .filter((entry) => Boolean(entry) && entry !== "*")
-            .map((entry) => normalizeGoogleChatTarget(entry) ?? entry),
-        ),
-      )
-        .filter((id) => (q ? id.toLowerCase().includes(q) : true))
-        .slice(0, limit && limit > 0 ? limit : undefined)
-        .map((id) => ({ kind: "user", id }) as const);
-      return peers;
+      return listDirectoryUserEntriesFromAllowFrom({
+        allowFrom: account.config.dm?.allowFrom,
+        query,
+        limit,
+        normalizeId: (entry) => normalizeGoogleChatTarget(entry) ?? entry,
+      });
     },
     listGroups: async ({ cfg, accountId, query, limit }) => {
       const account = resolveGoogleChatAccount({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         accountId,
       });
-      const groups = account.config.groups ?? {};
-      const q = query?.trim().toLowerCase() || "";
-      const entries = Object.keys(groups)
-        .filter((key) => key && key !== "*")
-        .filter((key) => (q ? key.toLowerCase().includes(q) : true))
-        .slice(0, limit && limit > 0 ? limit : undefined)
-        .map((id) => ({ kind: "group", id }) as const);
-      return entries;
+      return listDirectoryGroupEntriesFromMapKeys({
+        groups: account.config.groups,
+        query,
+        limit,
+      });
     },
   },
   resolver: {
@@ -291,7 +286,7 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
     resolveAccountId: ({ accountId }) => normalizeAccountId(accountId),
     applyAccountName: ({ cfg, accountId, name }) =>
       applyAccountNameToChannelSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         channelKey: "googlechat",
         accountId,
         name,
@@ -307,7 +302,7 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
     },
     applyAccountConfig: ({ cfg, accountId, input }) => {
       const namedConfig = applyAccountNameToChannelSection({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         channelKey: "googlechat",
         accountId,
         name: input.name,
@@ -315,7 +310,7 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
       const next =
         accountId !== DEFAULT_ACCOUNT_ID
           ? migrateBaseNameToDefaultAccount({
-              cfg: namedConfig as MoltbotConfig,
+              cfg: namedConfig,
               channelKey: "googlechat",
             })
           : namedConfig;
@@ -337,84 +332,41 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
         ...(webhookPath ? { webhookPath } : {}),
         ...(webhookUrl ? { webhookUrl } : {}),
       };
-      if (accountId === DEFAULT_ACCOUNT_ID) {
-        return {
-          ...next,
-          channels: {
-            ...next.channels,
-            "googlechat": {
-              ...(next.channels?.["googlechat"] ?? {}),
-              enabled: true,
-              ...configPatch,
-            },
-          },
-        } as MoltbotConfig;
-      }
-      return {
-        ...next,
-        channels: {
-          ...next.channels,
-          "googlechat": {
-            ...(next.channels?.["googlechat"] ?? {}),
-            enabled: true,
-            accounts: {
-              ...(next.channels?.["googlechat"]?.accounts ?? {}),
-              [accountId]: {
-                ...(next.channels?.["googlechat"]?.accounts?.[accountId] ?? {}),
-                enabled: true,
-                ...configPatch,
-              },
-            },
-          },
-        },
-      } as MoltbotConfig;
+      return applySetupAccountConfigPatch({
+        cfg: next,
+        channelKey: "googlechat",
+        accountId,
+        patch: configPatch,
+      });
     },
   },
   outbound: {
     deliveryMode: "direct",
-    chunker: (text, limit) =>
-      getGoogleChatRuntime().channel.text.chunkMarkdownText(text, limit),
+    chunker: (text, limit) => getGoogleChatRuntime().channel.text.chunkMarkdownText(text, limit),
     chunkerMode: "markdown",
     textChunkLimit: 4000,
-    resolveTarget: ({ to, allowFrom, mode }) => {
+    resolveTarget: ({ to }) => {
       const trimmed = to?.trim() ?? "";
-      const allowListRaw = (allowFrom ?? []).map((entry) => String(entry).trim()).filter(Boolean);
-      const allowList = allowListRaw
-        .filter((entry) => entry !== "*")
-        .map((entry) => normalizeGoogleChatTarget(entry))
-        .filter((entry): entry is string => Boolean(entry));
 
       if (trimmed) {
         const normalized = normalizeGoogleChatTarget(trimmed);
         if (!normalized) {
-          if ((mode === "implicit" || mode === "heartbeat") && allowList.length > 0) {
-            return { ok: true, to: allowList[0] };
-          }
           return {
             ok: false,
-            error: missingTargetError(
-              "Google Chat",
-              "<spaces/{space}|users/{user}> or channels.googlechat.dm.allowFrom[0]",
-            ),
+            error: missingTargetError("Google Chat", "<spaces/{space}|users/{user}>"),
           };
         }
         return { ok: true, to: normalized };
       }
 
-      if (allowList.length > 0) {
-        return { ok: true, to: allowList[0] };
-      }
       return {
         ok: false,
-        error: missingTargetError(
-          "Google Chat",
-          "<spaces/{space}|users/{user}> or channels.googlechat.dm.allowFrom[0]",
-        ),
+        error: missingTargetError("Google Chat", "<spaces/{space}|users/{user}>"),
       };
     },
     sendText: async ({ cfg, to, text, accountId, replyToId, threadId }) => {
       const account = resolveGoogleChatAccount({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         accountId,
       });
       const space = await resolveGoogleChatOutboundSpace({ account, target: to });
@@ -431,32 +383,51 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
         chatId: space,
       };
     },
-    sendMedia: async ({ cfg, to, text, mediaUrl, accountId, replyToId, threadId }) => {
+    sendMedia: async ({
+      cfg,
+      to,
+      text,
+      mediaUrl,
+      mediaLocalRoots,
+      accountId,
+      replyToId,
+      threadId,
+    }) => {
       if (!mediaUrl) {
         throw new Error("Google Chat mediaUrl is required.");
       }
       const account = resolveGoogleChatAccount({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         accountId,
       });
       const space = await resolveGoogleChatOutboundSpace({ account, target: to });
       const thread = (threadId ?? replyToId ?? undefined) as string | undefined;
       const runtime = getGoogleChatRuntime();
       const maxBytes = resolveChannelMediaMaxBytes({
-        cfg: cfg as MoltbotConfig,
+        cfg: cfg,
         resolveChannelLimitMb: ({ cfg, accountId }) =>
-          (cfg.channels?.["googlechat"] as { accounts?: Record<string, { mediaMaxMb?: number }>; mediaMaxMb?: number } | undefined)
-            ?.accounts?.[accountId]?.mediaMaxMb ??
+          (
+            cfg.channels?.["googlechat"] as
+              | { accounts?: Record<string, { mediaMaxMb?: number }>; mediaMaxMb?: number }
+              | undefined
+          )?.accounts?.[accountId]?.mediaMaxMb ??
           (cfg.channels?.["googlechat"] as { mediaMaxMb?: number } | undefined)?.mediaMaxMb,
         accountId,
       });
-      const loaded = await runtime.channel.media.fetchRemoteMedia(mediaUrl, {
-        maxBytes: maxBytes ?? (account.config.mediaMaxMb ?? 20) * 1024 * 1024,
-      });
+      const effectiveMaxBytes = maxBytes ?? (account.config.mediaMaxMb ?? 20) * 1024 * 1024;
+      const loaded = /^https?:\/\//i.test(mediaUrl)
+        ? await runtime.channel.media.fetchRemoteMedia({
+            url: mediaUrl,
+            maxBytes: effectiveMaxBytes,
+          })
+        : await runtime.media.loadWebMedia(mediaUrl, {
+            maxBytes: effectiveMaxBytes,
+            localRoots: mediaLocalRoots?.length ? mediaLocalRoots : undefined,
+          });
       const upload = await uploadGoogleChatAttachment({
         account,
         space,
-        filename: loaded.filename ?? "attachment",
+        filename: loaded.fileName ?? "attachment",
         buffer: loaded.buffer,
         contentType: loaded.contentType,
       });
@@ -466,7 +437,7 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
         text,
         thread,
         attachments: upload.attachmentUploadToken
-          ? [{ attachmentUploadToken: upload.attachmentUploadToken, contentName: loaded.filename }]
+          ? [{ attachmentUploadToken: upload.attachmentUploadToken, contentName: loaded.fileName }]
           : undefined,
       });
       return {
@@ -484,13 +455,15 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
       lastStopAt: null,
       lastError: null,
     },
-    collectStatusIssues: (accounts) =>
+    collectStatusIssues: (accounts): ChannelStatusIssue[] =>
       accounts.flatMap((entry) => {
         const accountId = String(entry.accountId ?? DEFAULT_ACCOUNT_ID);
         const enabled = entry.enabled !== false;
         const configured = entry.configured === true;
-        if (!enabled || !configured) return [];
-        const issues = [];
+        if (!enabled || !configured) {
+          return [];
+        }
+        const issues: ChannelStatusIssue[] = [];
         if (!entry.audience) {
           issues.push({
             channel: "googlechat",
@@ -526,25 +499,25 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
       lastProbeAt: snapshot.lastProbeAt ?? null,
     }),
     probeAccount: async ({ account }) => probeGoogleChat(account),
-    buildAccountSnapshot: ({ account, runtime, probe }) => ({
-      accountId: account.accountId,
-      name: account.name,
-      enabled: account.enabled,
-      configured: account.credentialSource !== "none",
-      credentialSource: account.credentialSource,
-      audienceType: account.config.audienceType,
-      audience: account.config.audience,
-      webhookPath: account.config.webhookPath,
-      webhookUrl: account.config.webhookUrl,
-      running: runtime?.running ?? false,
-      lastStartAt: runtime?.lastStartAt ?? null,
-      lastStopAt: runtime?.lastStopAt ?? null,
-      lastError: runtime?.lastError ?? null,
-      lastInboundAt: runtime?.lastInboundAt ?? null,
-      lastOutboundAt: runtime?.lastOutboundAt ?? null,
-      dmPolicy: account.config.dm?.policy ?? "pairing",
-      probe,
-    }),
+    buildAccountSnapshot: ({ account, runtime, probe }) => {
+      const base = buildComputedAccountStatusSnapshot({
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured: account.credentialSource !== "none",
+        runtime,
+        probe,
+      });
+      return {
+        ...base,
+        credentialSource: account.credentialSource,
+        audienceType: account.config.audienceType,
+        audience: account.config.audience,
+        webhookPath: account.config.webhookPath,
+        webhookUrl: account.config.webhookUrl,
+        dmPolicy: account.config.dm?.policy ?? "pairing",
+      };
+    },
   },
   gateway: {
     startAccount: async (ctx) => {
@@ -560,21 +533,27 @@ export const googlechatPlugin: ChannelPlugin<ResolvedGoogleChatAccount> = {
       });
       const unregister = await startGoogleChatMonitor({
         account,
-        config: ctx.cfg as MoltbotConfig,
+        config: ctx.cfg,
         runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
         webhookPath: account.config.webhookPath,
         webhookUrl: account.config.webhookUrl,
         statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
       });
-      return () => {
-        unregister?.();
-        ctx.setStatus({
-          accountId: account.accountId,
-          running: false,
-          lastStopAt: Date.now(),
-        });
-      };
+      // Keep the promise pending until abort (webhook mode is passive).
+      await new Promise<void>((resolve) => {
+        if (ctx.abortSignal.aborted) {
+          resolve();
+          return;
+        }
+        ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      unregister?.();
+      ctx.setStatus({
+        accountId: account.accountId,
+        running: false,
+        lastStopAt: Date.now(),
+      });
     },
   },
 };

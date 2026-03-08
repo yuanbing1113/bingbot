@@ -1,16 +1,14 @@
+import type { DirectoryConfigParams } from "../channels/plugins/directory-config.js";
 import {
   buildMessagingTarget,
-  ensureTargetId,
+  parseMentionPrefixOrAtUserTarget,
   requireTargetKind,
   type MessagingTarget,
   type MessagingTargetKind,
   type MessagingTargetParseOptions,
-  type DirectoryConfigParams,
-  type ChannelDirectoryEntry,
 } from "../channels/targets.js";
-
+import { rememberDiscordDirectoryUser } from "./directory-cache.js";
 import { listDiscordDirectoryPeersLive } from "./directory-live.js";
-import { resolveDiscordAccount } from "./accounts.js";
 
 export type DiscordTargetKind = MessagingTargetKind;
 
@@ -23,31 +21,22 @@ export function parseDiscordTarget(
   options: DiscordTargetParseOptions = {},
 ): DiscordTarget | undefined {
   const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  const mentionMatch = trimmed.match(/^<@!?(\d+)>$/);
-  if (mentionMatch) {
-    return buildMessagingTarget("user", mentionMatch[1], trimmed);
+  if (!trimmed) {
+    return undefined;
   }
-  if (trimmed.startsWith("user:")) {
-    const id = trimmed.slice("user:".length).trim();
-    return id ? buildMessagingTarget("user", id, trimmed) : undefined;
-  }
-  if (trimmed.startsWith("channel:")) {
-    const id = trimmed.slice("channel:".length).trim();
-    return id ? buildMessagingTarget("channel", id, trimmed) : undefined;
-  }
-  if (trimmed.startsWith("discord:")) {
-    const id = trimmed.slice("discord:".length).trim();
-    return id ? buildMessagingTarget("user", id, trimmed) : undefined;
-  }
-  if (trimmed.startsWith("@")) {
-    const candidate = trimmed.slice(1).trim();
-    const id = ensureTargetId({
-      candidate,
-      pattern: /^\d+$/,
-      errorMessage: "Discord DMs require a user id (use user:<id> or a <@id> mention)",
-    });
-    return buildMessagingTarget("user", id, trimmed);
+  const userTarget = parseMentionPrefixOrAtUserTarget({
+    raw: trimmed,
+    mentionPattern: /^<@!?(\d+)>$/,
+    prefixes: [
+      { prefix: "user:", kind: "user" },
+      { prefix: "channel:", kind: "channel" },
+      { prefix: "discord:", kind: "user" },
+    ],
+    atUserPattern: /^\d+$/,
+    atUserErrorMessage: "Discord DMs require a user id (use user:<id> or a <@id> mention)",
+  });
+  if (userTarget) {
+    return userTarget;
   }
   if (/^\d+$/.test(trimmed)) {
     if (options.defaultKind) {
@@ -72,19 +61,31 @@ export function resolveDiscordChannelId(raw: string): string {
  *
  * @param raw - The username or raw target string (e.g., "john.doe")
  * @param options - Directory configuration params (cfg, accountId, limit)
+ * @param parseOptions - Messaging target parsing options (defaults, ambiguity message)
  * @returns Parsed MessagingTarget with user ID, or undefined if not found
  */
 export async function resolveDiscordTarget(
   raw: string,
   options: DirectoryConfigParams,
+  parseOptions: DiscordTargetParseOptions = {},
 ): Promise<MessagingTarget | undefined> {
   const trimmed = raw.trim();
-  if (!trimmed) return undefined;
+  if (!trimmed) {
+    return undefined;
+  }
 
-  // If already a known format, parse directly
-  const directParse = parseDiscordTarget(trimmed, options);
-  if (directParse && directParse.kind !== "channel" && !isLikelyUsername(trimmed)) {
+  const likelyUsername = isLikelyUsername(trimmed);
+  const shouldLookup = isExplicitUserLookup(trimmed, parseOptions) || likelyUsername;
+
+  // Parse directly if it's already a known format. Use a safe parse so ambiguous
+  // numeric targets don't throw when we still want to attempt username lookup.
+  const directParse = safeParseDiscordTarget(trimmed, parseOptions);
+  if (directParse && directParse.kind !== "channel" && !likelyUsername) {
     return directParse;
+  }
+
+  if (!shouldLookup) {
+    return directParse ?? parseDiscordTarget(trimmed, parseOptions);
   }
 
   // Try to resolve as a username via directory lookup
@@ -99,15 +100,47 @@ export async function resolveDiscordTarget(
     if (match && match.kind === "user") {
       // Extract user ID from the directory entry (format: "user:<id>")
       const userId = match.id.replace(/^user:/, "");
+      rememberDiscordDirectoryUser({
+        accountId: options.accountId,
+        userId,
+        handles: [trimmed, match.name, match.handle],
+      });
       return buildMessagingTarget("user", userId, trimmed);
     }
-  } catch (error) {
+  } catch {
     // Directory lookup failed - fall through to parse as-is
     // This preserves existing behavior for channel names
   }
 
   // Fallback to original parsing (for channels, etc.)
-  return parseDiscordTarget(trimmed, options);
+  return parseDiscordTarget(trimmed, parseOptions);
+}
+
+function safeParseDiscordTarget(
+  input: string,
+  options: DiscordTargetParseOptions,
+): MessagingTarget | undefined {
+  try {
+    return parseDiscordTarget(input, options);
+  } catch {
+    return undefined;
+  }
+}
+
+function isExplicitUserLookup(input: string, options: DiscordTargetParseOptions): boolean {
+  if (/^<@!?(\d+)>$/.test(input)) {
+    return true;
+  }
+  if (/^(user:|discord:)/.test(input)) {
+    return true;
+  }
+  if (input.startsWith("@")) {
+    return true;
+  }
+  if (/^\d+$/.test(input)) {
+    return options.defaultKind === "user";
+  }
+  return false;
 }
 
 /**
